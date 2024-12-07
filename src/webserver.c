@@ -246,12 +246,7 @@ int handle_client(int client_fd) {
     size_t total_bytes = 0;
 
     while (1) {
-        size_t space = sizeof(buffer) - total_bytes - 1;
-        if (space == 0) {
-            return send_response(client_fd, 400, "Bad Request", "Request Too Long", 15);
-        }
-
-        ssize_t bytes_read = recv(client_fd, buffer + total_bytes, space, 0);
+        ssize_t bytes_read = recv(client_fd, buffer + total_bytes, sizeof(buffer) - total_bytes - 1, 0);
         if (bytes_read <= 0) {
             if (bytes_read < 0) {
                 perror("recv failed");
@@ -263,35 +258,41 @@ int handle_client(int client_fd) {
         total_bytes += bytes_read;
         buffer[total_bytes] = '\0';
 
-        char *current = buffer;
-        char *next_request;
+        while (1) {
+            char *headers_end = strstr(buffer, "\r\n\r\n");
+            if (!headers_end) {
+                // Headers not fully received yet
+                break;
+            }
 
-        while ((next_request = strstr(current, "\r\n\r\n")) != NULL) {
-            size_t request_length = next_request - current + 4;
+            size_t headers_length = headers_end - buffer + 4;
+            ssize_t content_length = get_content_length(buffer);
+            if (content_length < 0) {
+                // No Content-Length; assume no body
+                content_length = 0;
+            }
 
-            char saved_char = current[request_length];
-            current[request_length] = '\0';
+            size_t total_request_length = headers_length + content_length;
+            if (total_bytes < total_request_length) {
+                // Entire body not received yet
+                break;
+            }
 
-            int process_result = process_request(current, client_fd);
-            
+            // Null-terminate the entire request including body
+            buffer[total_request_length] = '\0';
+
+            // Process the complete request
+            int process_result = process_request(buffer, client_fd);
             if (process_result < 0) {
                 fprintf(stderr, "Error processing request\n");
                 return -1;
             }
 
-            current[request_length] = saved_char;
-            current += request_length;
-
-            if (current < buffer + total_bytes) {
-                size_t remaining = total_bytes - (current - buffer);
-                memmove(buffer, current, remaining);
-                total_bytes = remaining;
-                current = buffer;
-            } else {
-                total_bytes = 0;
-                buffer[0] = '\0';
-                break;
-            }
+            // Move remaining data to the beginning of the buffer
+            size_t remaining = total_bytes - total_request_length;
+            memmove(buffer, buffer + total_request_length, remaining);
+            total_bytes = remaining;
+            buffer[total_bytes] = '\0';
         }
     }
 
