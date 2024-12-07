@@ -6,6 +6,7 @@
         "netdb.h": "c",
         "socket.h": "c",
         "string.h": "c",
-        "stdlib.h": "c"
+        "stdlib.h": "c",
+        "inet.h": "c"
     }
 }
