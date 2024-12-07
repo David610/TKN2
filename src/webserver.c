@@ -1,4 +1,4 @@
-#define _GNU_SOURCE  // Enable GNU extensions before including headers
+#define _GNU_SOURCE  // Enable GNU extensions for strcasestr
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,128 +12,136 @@
 #include <ctype.h>
 
 /* Configuration constants */
-#define BUFFER_SIZE 8192             // Maximum size for request/response buffers
-#define STATIC_RESP_COUNT 3          // Number of static resources
-#define DYNAMIC_RESOURCES_COUNT 100  // Maximum number of dynamic resources
+#define BUFFER_SIZE 8192
+#define STATIC_RESP_COUNT 3
+#define DYNAMIC_RESOURCES_COUNT 1000
 
 /* Data structures for resource management */
 typedef struct {
-    const char *path;    // URL path for the resource
-    const char *content; // Content of the resource
+    const char *path;
+    const char *content;
+    size_t content_length;  // Added to track static content length
 } StaticResource;
 
 typedef struct {
-    char path[256];             // URL path for the resource
-    char content[BUFFER_SIZE];  // Content of the resource
-    bool in_use;                // Whether this slot is currently used
+    char path[256];
+    char content[BUFFER_SIZE];
+    bool in_use;
+    size_t content_length;
 } DynamicResource;
 
 /* Predefined static resources */
 StaticResource static_resources[] = {
-    {"/static/foo", "Foo"},
-    {"/static/bar", "Bar"},
-    {"/static/baz", "Baz"}
+    {"/static/foo", "Foo", 3},
+    {"/static/bar", "Bar", 3},
+    {"/static/baz", "Baz", 3}
 };
 
 /* Array for storing dynamic resources */
 DynamicResource dynamic_resources[DYNAMIC_RESOURCES_COUNT] = {0};
 
 /**
- * Helper function to search for headers case-insensitively.
- * Returns pointer to the header value or NULL if not found.
- * The caller is responsible for freeing the returned string.
+ * Helper function to get content length from headers
  */
-char *find_header(const char *request, const char *header_name) {
-    char *header_loc = strcasestr(request, header_name);
-    if (!header_loc) return NULL;
-
-    // Move pointer to the end of the header name
-    header_loc += strlen(header_name);
-
-    // Skip any whitespace and the ':' character
-    while (*header_loc && (*header_loc == ' ' || *header_loc == ':' || *header_loc == '\t')) {
-        header_loc++;
+ssize_t get_content_length(const char *request) {
+    const char *cl_header = strcasestr(request, "Content-Length:");
+    if (!cl_header) {
+        return -1;
     }
-
-    // Find end of header value
-    char *end = strstr(header_loc, "\r\n");
-    if (!end) return NULL;
-
-    size_t value_length = end - header_loc;
-    char *value = (char *)malloc(value_length + 1);
-    if (!value) return NULL;
-
-    strncpy(value, header_loc, value_length);
-    value[value_length] = '\0';
-
-    return value;
+    ssize_t length = 0;
+    if (sscanf(cl_header + 15, "%zd", &length) != 1) {
+        return -1;
+    }
+    return length;
 }
 
 /**
- * Sends an HTTP response with proper formatting.
- * Ensures complete sending of all data even with partial sends.
+ * Helper function for reliable sending
  */
-void send_response(int client_fd, int status_code, const char *status_text, const char *body) {
-    char response[BUFFER_SIZE];
-    int content_length = body ? strlen(body) : 0;
-
-    // Format the complete response
-    int total_len = snprintf(response, sizeof(response),
-             "HTTP/1.1 %d %s\r\n"
-             "Content-Length: %d\r\n"
-             "Connection: keep-alive\r\n"
-             "\r\n"
-             "%s",
-             status_code, status_text, content_length, body ? body : "");
-
-    // Send with reliable delivery
-    size_t sent = 0;
-    while (sent < total_len) {
-        ssize_t result = send(client_fd, response + sent, total_len - sent, MSG_NOSIGNAL);
-        if (result < 0) {
-            if (errno == EPIPE) return;  // Client disconnected
+ssize_t send_all(int sock_fd, const char *buffer, size_t length) {
+    size_t total_sent = 0;
+    while (total_sent < length) {
+        ssize_t sent = send(sock_fd, buffer + total_sent, length - total_sent, MSG_NOSIGNAL);
+        if (sent < 0) {
+            if (errno == EPIPE) return -1;
             perror("send failed");
-            return;
+            return -1;
         }
-        sent += result;
+        total_sent += sent;
     }
+    return total_sent;
 }
 
 /**
- * Processes a single complete HTTP request.
- * Handles method validation, resource location, and response generation.
+ * Send HTTP response with content length
+ * Returns 0 on success, -1 on error
  */
-void process_request(const char *request, int client_fd) {
-    // Parse request line
+int send_response(int client_fd, int status_code, const char *status_text, 
+                 const char *body, size_t content_length) {
+    char header[BUFFER_SIZE];
+    int header_len = snprintf(header, sizeof(header),
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        status_code, status_text, content_length);
+
+    if (send_all(client_fd, header, header_len) < 0) {
+        return -1;
+    }
+
+    if (body && content_length > 0) {
+        if (send_all(client_fd, body, content_length) < 0) {
+            return -1;
+        }
+    }
+    
+    return 0;
+}
+
+/**
+ * Process HTTP request
+ * Returns 0 on success, -1 on error
+ */
+int process_request(const char *request, int client_fd) {
     char method[16] = {0};
     char path[256] = {0};
     char version[16] = {0};
 
+    printf("\n=== New Request ===\n");
+
     if (sscanf(request, "%15s %255s %15s", method, path, version) != 3) {
-        send_response(client_fd, 400, "Bad Request", "Invalid Request Format");
-        return;
+        printf("Failed to parse request line\n");
+        return send_response(client_fd, 400, "Bad Request", "Invalid Request Format", 21);
     }
 
-    // Handle HEAD requests specifically
+    printf("Method: %s\nPath: %s\nVersion: %s\n", method, path, version);
+
+    // Handle HEAD method
     if (strcasecmp(method, "HEAD") == 0) {
-        send_response(client_fd, 501, "Not Implemented", NULL);
-        return;
+        return send_response(client_fd, 501, "Not Implemented", NULL, 0);
     }
 
     // Handle static resources
     if (strncmp(path, "/static/", 8) == 0) {
+        if (strcasecmp(method, "GET") != 0) {
+            return send_response(client_fd, 405, "Method Not Allowed", NULL, 0);
+        }
+
         for (int i = 0; i < STATIC_RESP_COUNT; i++) {
             if (strcmp(path, static_resources[i].path) == 0) {
-                send_response(client_fd, 200, "OK", static_resources[i].content);
-                return;
+                return send_response(client_fd, 200, "OK", 
+                                  static_resources[i].content,
+                                  static_resources[i].content_length);
             }
         }
-        send_response(client_fd, 404, "Not Found", "Resource Not Found");
-        return;
+        return send_response(client_fd, 404, "Not Found", NULL, 0);
     }
 
     // Handle dynamic resources
     if (strncmp(path, "/dynamic/", 9) == 0) {
+        printf("\nDynamic resource handling for path: '%s'\n", path);
+
         int resource_index = -1;
         int available_slot = -1;
 
@@ -142,6 +150,7 @@ void process_request(const char *request, int client_fd) {
             if (dynamic_resources[i].in_use) {
                 if (strcmp(dynamic_resources[i].path, path) == 0) {
                     resource_index = i;
+                    printf("Found existing resource at index %d\n", i);
                     break;
                 }
             } else if (available_slot == -1) {
@@ -149,172 +158,144 @@ void process_request(const char *request, int client_fd) {
             }
         }
 
-        // Handle GET requests
-        if (strcasecmp(method, "GET") == 0) {
-            if (resource_index != -1) {
-                send_response(client_fd, 200, "OK", dynamic_resources[resource_index].content);
-            } else {
-                send_response(client_fd, 404, "Not Found", "Resource Not Found");
-            }
-            return;
-        }
-
         // Handle PUT requests
         if (strcasecmp(method, "PUT") == 0) {
-            // Find the start of the body
-            const char *body = strstr(request, "\r\n\r\n");
-            if (!body) {
-                send_response(client_fd, 400, "Bad Request", "Missing Content");
-                return;
-            }
-            body += 4;  // Skip past \r\n\r\n
-
-            // Calculate the body length based on Content-Length
-            char *content_length_str = find_header(request, "Content-Length");
-            int content_length = 0;
-            if (content_length_str) {
-                content_length = atoi(content_length_str);
-                free(content_length_str);
-            } else {
-                // No Content-Length provided
-                send_response(client_fd, 411, "Length Required", "Content-Length Header Missing");
-                return;
+            const char *headers_end = strstr(request, "\r\n\r\n");
+            if (!headers_end) {
+                return send_response(client_fd, 400, "Bad Request", "Missing headers", 14);
             }
 
-            // Ensure that the body length matches the Content-Length
-            if ((int)strlen(body) < content_length) {
-                send_response(client_fd, 400, "Bad Request", "Incomplete Body");
-                return;
+            const char *body = headers_end + 4;
+            ssize_t content_length = get_content_length(request);
+            
+            printf("PUT request - Content-Length: %zd\n", content_length);
+
+            if (content_length < 0 || content_length >= BUFFER_SIZE) {
+                return send_response(client_fd, 411, "Length Required", 
+                                  "Invalid Content-Length", 20);
             }
 
-            // Create or update the resource
             if (resource_index != -1) {
                 // Update existing resource
-                strncpy(dynamic_resources[resource_index].content, body, 
-                        sizeof(dynamic_resources[resource_index].content) - 1);
-                dynamic_resources[resource_index].content[sizeof(dynamic_resources[resource_index].content) - 1] = '\0';
-                send_response(client_fd, 204, "No Content", NULL);
+                memset(dynamic_resources[resource_index].content, 0, BUFFER_SIZE);
+                memcpy(dynamic_resources[resource_index].content, body, content_length);
+                dynamic_resources[resource_index].content_length = content_length;
+                printf("Updated resource %d with %zd bytes\n", resource_index, content_length);
+                return send_response(client_fd, 204, "No Content", NULL, 0);
             } else if (available_slot != -1) {
                 // Create new resource
                 dynamic_resources[available_slot].in_use = true;
                 strncpy(dynamic_resources[available_slot].path, path,
                         sizeof(dynamic_resources[available_slot].path) - 1);
                 dynamic_resources[available_slot].path[sizeof(dynamic_resources[available_slot].path) - 1] = '\0';
-                strncpy(dynamic_resources[available_slot].content, body,
-                        sizeof(dynamic_resources[available_slot].content) - 1);
-                dynamic_resources[available_slot].content[sizeof(dynamic_resources[available_slot].content) - 1] = '\0';
-                send_response(client_fd, 201, "Created", NULL);
+                
+                memset(dynamic_resources[available_slot].content, 0, BUFFER_SIZE);
+                memcpy(dynamic_resources[available_slot].content, body, content_length);
+                dynamic_resources[available_slot].content_length = content_length;
+                
+                printf("Created resource at slot %d with path '%s', content length %zd\n", 
+                       available_slot, dynamic_resources[available_slot].path, content_length);
+                return send_response(client_fd, 201, "Created", NULL, 0);
             } else {
-                send_response(client_fd, 507, "Insufficient Storage", NULL);
+                return send_response(client_fd, 507, "Insufficient Storage", NULL, 0);
             }
-            return;
+        }
+
+        // Handle GET requests
+        if (strcasecmp(method, "GET") == 0) {
+            if (resource_index != -1) {
+                size_t content_length = dynamic_resources[resource_index].content_length;
+                printf("GET request - Serving content from resource %d, length: %zu\n", 
+                       resource_index, content_length);
+                
+                return send_response(client_fd, 200, "OK",
+                                  dynamic_resources[resource_index].content,
+                                  content_length);
+            } else {
+                printf("Resource not found for path: '%s'\n", path);
+                return send_response(client_fd, 404, "Not Found", NULL, 0);
+            }
         }
 
         // Handle DELETE requests
         if (strcasecmp(method, "DELETE") == 0) {
             if (resource_index != -1) {
                 dynamic_resources[resource_index].in_use = false;
-                send_response(client_fd, 204, "No Content", NULL);
+                memset(dynamic_resources[resource_index].content, 0, BUFFER_SIZE);
+                dynamic_resources[resource_index].content_length = 0;
+                return send_response(client_fd, 204, "No Content", NULL, 0);
             } else {
-                send_response(client_fd, 404, "Not Found", NULL);
+                return send_response(client_fd, 404, "Not Found", NULL, 0);
             }
-            return;
         }
+
+        // Method not allowed
+        return send_response(client_fd, 405, "Method Not Allowed", NULL, 0);
     }
 
-    // Default response for unknown resources or methods
-    send_response(client_fd, 404, "Not Found", "Resource Not Found");
+    // Default response for unknown paths
+    return send_response(client_fd, 404, "Not Found", NULL, 0);
 }
 
 /**
- * Handles client connection and request processing.
- * Maintains connection state and handles partial requests.
+ * Handle client connection
+ * Returns 0 on success, -1 on error
  */
-void handle_client(int client_fd) {
+int handle_client(int client_fd) {
     char buffer[BUFFER_SIZE] = {0};
     size_t total_bytes = 0;
 
     while (1) {
-        // Read new data
-        ssize_t bytes_read = recv(client_fd, buffer + total_bytes, 
-                                  sizeof(buffer) - total_bytes - 1, 0);
-        
-        if (bytes_read < 0) {
-            perror("recv failed");
-            break;
-        } else if (bytes_read == 0) {
-            // Connection closed by client
-            break;
+        size_t space = sizeof(buffer) - total_bytes - 1;
+        if (space == 0) {
+            return send_response(client_fd, 400, "Bad Request", "Request Too Long", 15);
+        }
+
+        ssize_t bytes_read = recv(client_fd, buffer + total_bytes, space, 0);
+        if (bytes_read <= 0) {
+            if (bytes_read < 0) {
+                perror("recv failed");
+                return -1;
+            }
+            break;  // Connection closed by client
         }
 
         total_bytes += bytes_read;
         buffer[total_bytes] = '\0';
 
-        // Process all complete requests in the buffer
         char *current = buffer;
-        while (1) {
-            // Find the end of headers
-            char *end_of_headers = strstr(current, "\r\n\r\n");
-            if (!end_of_headers) {
-                // Incomplete headers
+        char *next_request;
+
+        while ((next_request = strstr(current, "\r\n\r\n")) != NULL) {
+            size_t request_length = next_request - current + 4;
+
+            char saved_char = current[request_length];
+            current[request_length] = '\0';
+
+            int process_result = process_request(current, client_fd);
+            
+            if (process_result < 0) {
+                fprintf(stderr, "Error processing request\n");
+                return -1;
+            }
+
+            current[request_length] = saved_char;
+            current += request_length;
+
+            if (current < buffer + total_bytes) {
+                size_t remaining = total_bytes - (current - buffer);
+                memmove(buffer, current, remaining);
+                total_bytes = remaining;
+                current = buffer;
+            } else {
+                total_bytes = 0;
+                buffer[0] = '\0';
                 break;
             }
-
-            // Calculate header length
-            size_t headers_length = end_of_headers - current + 4;
-
-            // Parse headers to find Content-Length
-            char *content_length_str = find_header(current, "Content-Length");
-            int content_length = 0;
-            if (content_length_str) {
-                content_length = atoi(content_length_str);
-                free(content_length_str);
-            }
-
-            // Calculate total request length (headers + body)
-            size_t total_request_length = headers_length + content_length;
-
-            // Check if the entire request has been received
-            if (total_bytes < (current - buffer) + total_request_length) {
-                // Entire request not yet received
-                break;
-            }
-
-            // Extract the complete request (headers + body)
-            char *complete_request = (char *)malloc(total_request_length + 1);
-            if (!complete_request) {
-                perror("malloc failed");
-                return;
-            }
-            memcpy(complete_request, current, total_request_length);
-            complete_request[total_request_length] = '\0';
-
-            // Process the complete request
-            process_request(complete_request, client_fd);
-            free(complete_request);
-
-            // Move to the next request in the buffer
-            current += total_request_length;
-        }
-
-        // Calculate remaining bytes and move them to the start of the buffer
-        size_t processed_bytes = current - buffer;
-        size_t remaining = total_bytes - processed_bytes;
-        if (remaining > 0) {
-            memmove(buffer, current, remaining);
-            total_bytes = remaining;
-            buffer[total_bytes] = '\0';
-        } else {
-            total_bytes = 0;
-            buffer[0] = '\0';
-        }
-
-        // Handle buffer overflow
-        if (total_bytes >= sizeof(buffer) - 1) {
-            send_response(client_fd, 400, "Bad Request", "Request Too Long");
-            break;
         }
     }
+
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -326,7 +307,6 @@ int main(int argc, char *argv[]) {
     const char *ip = argv[1];
     int port = atoi(argv[2]);
 
-    // Create and configure server socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket creation failed");
@@ -340,18 +320,15 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Set up server address
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));  // Ensure zeroed memory
+    struct sockaddr_in server_addr = {0};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
     if (inet_pton(AF_INET, ip, &server_addr.sin_addr) <= 0) {
-        perror("Invalid IP address");
+        perror("Invalid address");
         close(server_fd);
         return EXIT_FAILURE;
     }
 
-    // Bind and listen
     if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind failed");
         close(server_fd);
@@ -366,7 +343,6 @@ int main(int argc, char *argv[]) {
 
     printf("Server listening on %s:%d\n", ip, port);
 
-    // Main server loop
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
@@ -374,13 +350,17 @@ int main(int argc, char *argv[]) {
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
             perror("accept failed");
-            continue;
+            break;  // Exit the server loop on accept error
         }
 
-        handle_client(client_fd);
-        close(client_fd);
+        // Handle client and check for errors
+        if (handle_client(client_fd) < 0) {
+            fprintf(stderr, "Error handling client\n");
+        }
+        
+        close(client_fd);  // Always close the client socket
     }
 
-    close(server_fd);
-    return EXIT_SUCCESS;
+    close(server_fd);  // Close server socket before exit
+    return EXIT_FAILURE;  // Return failure since we broke out of the accept loop
 }

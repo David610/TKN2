@@ -4,6 +4,8 @@
         "types.h": "c",
         "stdbool.h": "c",
         "netdb.h": "c",
-        "socket.h": "c"
+        "socket.h": "c",
+        "string.h": "c",
+        "stdlib.h": "c"
     }
 }
